@@ -1,0 +1,18 @@
+[Unit]
+Description=Tilt Hydrometer web dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/tilt-logger/tilt_dashboard.py --logfile /var/log/tilt/tilt.jsonl --port 8080 --allow-updates
+Restart=on-failure
+RestartSec=10
+User=tilt
+Group=tilt
+# systemd creates /var/log/tilt owned by tilt:tilt automatically
+LogsDirectory=tilt
+LogsDirectoryMode=0755
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+# Runtime data this dashboard writes beside the log file -- not source, and
+# usually specific to one person's actual brews/hardware, so it shouldn't be
+# committed to the repo (each install generates its own).
+tilt.jsonl
+batches.json
+brand.json
+stages.json
+recipe-data.json
+recipe-drafts.json
+logger-settings.json
+*.bak
+
+# Local test/dev scratch
+__pycache__/
+*.pyc
+.DS_Store

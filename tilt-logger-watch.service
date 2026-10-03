@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart tilt-logger after a web update
+
+[Service]
+Type=oneshot
+# small delay so the file write fully settles before the restart
+ExecStartPre=/bin/sleep 2
+ExecStart=/bin/systemctl restart tilt-logger.service

@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart tilt-logger when its script is updated from the dashboard
+
+[Path]
+PathChanged=/opt/tilt-logger/tilt_logger.py
+
+[Install]
+WantedBy=multi-user.target

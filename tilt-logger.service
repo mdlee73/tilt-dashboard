@@ -1,0 +1,22 @@
+[Unit]
+Description=Tilt Hydrometer JSON logger
+After=bluetooth.target
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+# Log every beacon (default). Add e.g. --interval 60 or --color Red if desired.
+ExecStart=/usr/bin/python3 /opt/tilt-logger/tilt_logger.py --logfile /var/log/tilt/tilt.jsonl
+Restart=on-failure
+RestartSec=10
+User=tilt
+Group=tilt
+# systemd creates /var/log/tilt owned by tilt:tilt automatically
+LogsDirectory=tilt
+LogsDirectoryMode=0755
+# Allow raw BLE access without running as root
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
