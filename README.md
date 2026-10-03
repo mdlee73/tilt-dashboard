@@ -31,9 +31,9 @@ A Pi 3B+ (or better) with Bluetooth is cheap, sips power, and can sit next to th
 
 ## What it looks like
 
-![Tilt Dashboard overview with two batches fermenting, synced gravity/ABV/temperature charts](docs/screenshot.png)
+![Tilt Dashboard overview showing six active mead batches with photos, live gravity/ABV/temperature stats, and a synced chart](docs/screenshot.png)
 
-This is the generic default branding, straight out of the box — set your own name and tagline under **Admin → Branding** and it's yours, no code changes needed. Beyond the overview above, there's also a History tab of every finished batch, and an Admin page for logging interval, data resets, recipe-wheel editing, the fermentation-stage list, branding, and software updates — all from the browser.
+A real instance mid-brew — six Tilts, each with its own batch photo, live stats, and a synced chart. The branding shown here ("Swamp Hollow") is just one example of what you can set under **Admin → Branding**; a fresh install starts out generic ("Tilt Dashboard") until you make it your own, no code changes needed. Beyond the overview above, there's also a History tab of every finished batch, and an Admin page for logging interval, data resets, recipe-wheel editing, the fermentation-stage list, branding, and software updates — all from the browser.
 
 ## License
 
