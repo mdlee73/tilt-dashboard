@@ -33,7 +33,33 @@ A Pi 3B+ (or better) with Bluetooth is cheap, sips power, and can sit next to th
 
 ![Tilt Dashboard overview showing six active mead batches with photos, live gravity/ABV/temperature stats, and a synced chart](docs/screenshot.png)
 
-A real instance mid-brew — six Tilts, each with its own batch photo, live stats, and a synced chart. The branding shown here ("Swamp Hollow") is just one example of what you can set under **Admin → Branding**; a fresh install starts out generic ("Tilt Dashboard") until you make it your own, no code changes needed. Beyond the overview above, there's also a History tab of every finished batch, and an Admin page for logging interval, data resets, recipe-wheel editing, the fermentation-stage list, branding, and software updates — all from the browser.
+A real instance mid-brew — six Tilts, each with its own batch photo, live stats, and a synced chart. The branding shown here ("Swamp Hollow") is just one example of what you can set under **Admin → Branding**; a fresh install starts out generic ("Tilt Dashboard") until you make it your own, no code changes needed.
+
+### A single Tilt, in detail
+
+![Detail view for one Tilt, with batch photo, notes, and live stat tiles for gravity, temperature, ABV, and attenuation](docs/batch_detail.jpg)
+
+Click into any Tilt for its own view — the batch photo and notes, live stat tiles, and, further down the page, a synced Specific Gravity / Est. ABV / Temperature chart stack with a marker for any note you've pinned:
+
+![Synced Specific Gravity, Est. ABV, and Temperature charts for one batch](docs/charts.jpg)
+
+### History
+
+![History tab listing two finished batches with their label art and final stats](docs/history.jpg)
+
+Every finished batch moves to **History** with its final stats intact — and whatever label art you dropped in along the way.
+
+### Mead recipe builder
+
+![Recipe Explorer: a honey/water calculator with target style and ABV, a yeast picker, and a flavor wheel](docs/recipe.jpg)
+
+Pick a style and target ABV and the built-in calculator works out the honey, water, and a yeast suggestion on the spot — then tag flavor and aroma notes from the wheels below. The **Recipe Explorer** (`/recipes`) works standalone, with nothing brewing yet, for sketching ideas before you buy anything.
+
+### Built-in user guide
+
+![The dashboard's own user guide page, open to "Reading the dashboard"](docs/guide.jpg)
+
+Every install also serves its own end-user guide at `/guide` — no internet connection needed to read it.
 
 ## License
 
