@@ -1092,6 +1092,9 @@ def tilt_summary(mine, batch, hours, now):
         "stats": stats_for(wrecs, batch, now),
         "series": series_window(wrecs, hours, now),
         "n_total": len(wrecs),
+        # newest reading for this colour, even outside the batch window, so the
+        # UI can explain "no data" when the batch starts after every reading
+        "last_reading": round(mine[-1][0]) if mine else None,
     }
 
 
@@ -2588,8 +2591,10 @@ function ago(t, now) {
   return (s / 86400).toFixed(1) + "d ago";
 }
 function dayNo(startTs, now) { return Math.max(1, Math.floor((now - startTs) / 86400) + 1); }
-// <input type=date> value <-> epoch seconds, anchored at local noon so the
-// chosen calendar day never shifts across a timezone/DST boundary.
+// <input type=date> value <-> epoch seconds. A brew date is a whole calendar
+// day, so it's anchored at the START of that local day: every reading logged
+// on that day belongs to the batch. (It used to be local noon, which silently
+// hid anything logged earlier that morning -- a batch looked empty until noon.)
 function isoDateLocal(ts) {
   const d = new Date(ts * 1000);
   return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") +
@@ -2597,8 +2602,15 @@ function isoDateLocal(ts) {
 }
 function dateStrToTs(s) {
   if (!s) return null;
-  const t = new Date(s + "T12:00:00");
+  const t = new Date(s + "T00:00:00");
   return isNaN(t) ? null : Math.floor(t.getTime() / 1000);
+}
+// Why a batch has no data: its start is after the newest reading we have.
+function noDataWhy(batch, lastReading) {
+  if (!batch || !batch.start_ts || lastReading == null || batch.start_ts <= lastReading) return null;
+  return "no readings since this batch's start (" +
+    new Date(batch.start_ts * 1000).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) +
+    ") — edit the brew date to include earlier readings";
 }
 function niceStep(range, cands) {
   for (const c of cands) if (range / c <= 6) return c;
@@ -2764,7 +2776,8 @@ function renderAll(D) {
       el(c, "div", "bmeta", "last seen " + ago(t.stats.last_seen, now))
         .style.marginTop = "6px";
     } else {
-      el(c, "div", "bmeta", targetAbv != null
+      const why = noDataWhy(t.batch, t.last_reading);
+      el(c, "div", "bmeta", why ? why : targetAbv != null
         ? "no readings yet · target " + Number(targetAbv).toFixed(1) + "% ABV"
         : "no readings in this batch yet");
     }
@@ -2964,9 +2977,10 @@ function renderOne(D) {
            "as of " + ago(S.battery_ts, now));
   } else if (b) {
     tile("Waiting for readings", "—",
-         b.target_abv != null
+         noDataWhy(b, D.last_reading) ||
+         (b.target_abv != null
            ? "target " + Number(b.target_abv).toFixed(1) + "% ABV"
-           : "new batch, no data yet");
+           : "new batch, no data yet"));
   } else {
     tile("No active batch", "—",
          "use “Add batch details” above to start one, or check History for past brews");
@@ -3877,6 +3891,7 @@ function openModal(rebrew) {
   const curStart = rebrewFrom ? (Date.now() / 1000)
     : (b.start_ts ?? (D.stats && D.stats.first_ts));
   $("f_start").value = curStart != null ? isoDateLocal(curStart) : "";
+  startPrefill = $("f_start").value;   // fields() only sends a date the user actually changed
   $("f_size").value = b.batch_size || "";
   $("f_yeast").value = b.yeast || "";
   $("f_ibu").value = b.ibu ?? "";
@@ -3940,6 +3955,7 @@ $("f_img").addEventListener("change", ev => {
 $("imgclear").addEventListener("click", () => {
   imgState = ""; $("f_img").value = ""; showImgPreview(null);
 });
+let startPrefill = "";
 function fields() {
   const o = {
     name: $("f_name").value, style: $("f_style").value,
@@ -3949,7 +3965,11 @@ function fields() {
     temp_target_f: $("f_temp").value,
     notes: $("f_notes").value,
   };
-  const st = dateStrToTs($("f_start").value);
+  // Only send the brew date if the user changed it. Re-sending the pre-filled
+  // value would re-anchor the start to that date's boundary on every Save (and
+  // make "Start new batch"/Rebrew inherit the old batch's date instead of now).
+  const sv = $("f_start").value;
+  const st = sv !== startPrefill ? dateStrToTs(sv) : null;
   if (st != null) o.start_ts = st;
   if (imgState !== undefined) o.image = imgState;
   return o;
