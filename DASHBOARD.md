@@ -32,7 +32,9 @@ Everything auto-refreshes every 30 seconds and follows your device's light/dark 
 
 Formulas: ABV = (OG − SG) × 131.25 and apparent attenuation = (OG − SG) / (OG − 1) × 100 (the standard homebrewing approximations). OG is your entered "Measured OG" if set, otherwise the first reading of the batch.
 
-Note: two Tilts of the same colour can't be told apart — they share an iBeacon UUID — so simultaneous batches need different-coloured Tilts.
+**Same-colour Tilts** — two Tilts of one colour share a UUID, but each broadcast also carries the sender's Bluetooth address, which the logger records (`"address"` in every log line). The dashboard uses it to tell them apart: the first address it ever sees for a colour keeps the plain colour name (`Red`), further ones become `Red-2`, `Red-3`, … (shown as **Red #2** and drawn in a progressively lighter shade), each with its own tab, batches, History and reports. The mapping is stored in `tilts.json` beside the log. This needs the current `tilt_logger.py` as well as the dashboard — the logger is what records the address; older log lines with no address are treated as the first Tilt of their colour, so existing data is untouched.
+
+**Thin old data (Admin)** — a log that has been running a long time (especially with the logging interval at "every beacon", which adds roughly 100,000 readings per day per Tilt) makes every page load and refresh slower. **Admin → Thin old data** shrinks the *old* part of the log: pick a cutoff (1, 2, 3, 7, 14 or 30 days) and a spacing (one reading per Tilt every 5, 10, 15 or 30 minutes) and click **Thin old data…**. A progress line shows it working. It first checks the log and tells you exactly how many readings would be removed and how much smaller the file would get — nothing changes until you confirm. Batches are not affected: batch records (names, recipes, notes, brew dates, stage markers, chart notes, History summaries) live in separate files and are never touched, and each batch keeps its first and last reading and its highest and lowest temperature, so OG, final gravity and min/max stats are unchanged. Older charts, reports and CSVs simply have fewer points. Readings newer than the cutoff, readings carrying a battery report, and any line the dashboard can't parse are left exactly as they are. Before rewriting, the log is copied to `tilt.jsonl.pre-thin.bak` beside it; once everything looks right, **Delete backup** in the same card removes it (only the most recent backup is kept, and thinning again replaces it). It needs enough free disk space for the backup, streams the file rather than loading it into memory, and may take a while on a big log on a Pi — keep the page open until it says **Done**.
 
 ## Install
 
@@ -59,11 +61,11 @@ Find the Pi's address with `hostname -I` on the Pi; on networks with mDNS, `http
 python3 tilt_dashboard.py --logfile /var/log/tilt/tilt.jsonl --port 8080
 ```
 
-Options: `--port` (default 8080), `--logfile`, `--batchfile` (default: `batches.json` beside the log), `--stagesfile` (default: `stages.json` beside the log), `--brandfile` (default: `brand.json` beside the log — the Admin → Branding name/tagline), and `--host` (default `0.0.0.0`, i.e. reachable from other machines; use `127.0.0.1` to restrict to the Pi itself).
+Options: `--port` (default 8080), `--logfile`, `--batchfile` (default: `batches.json` beside the log), `--stagesfile` (default: `stages.json` beside the log), `--brandfile` (default: `brand.json` beside the log — the Admin → Branding name/tagline), `--tiltsfile` (default: `tilts.json` beside the log — the same-colour Tilt registry), and `--host` (default `0.0.0.0`, i.e. reachable from other machines; use `127.0.0.1` to restrict to the Pi itself).
 
 ## Performance notes
 
-The server parses the log once at the first request and afterwards only reads newly appended lines, so it stays fast even with every-beacon logging (expect a several-second first page load on a Pi 3B+ with a large log, near-instant after that). Chart data is downsampled server-side to ≤400 points per series. Log rotation (SETUP.md) is detected and handled automatically.
+The server reads the log once at startup (in the background) and afterwards only reads newly appended lines; readings are indexed per Tilt and time windows found by binary search, so refreshes stay fast on a large log. Chart data is downsampled server-side to ≤400 points per series. Log size is what slows things down — use a 1-minute (or longer) logging interval and **Admin → Thin old data** if the log has grown big (hundreds of thousands of readings). Log rotation (SETUP.md) is detected and handled automatically.
 
 ## Security note
 
@@ -76,6 +78,9 @@ GET  /api/overview?hours=168          Tilts WITH an active batch: batch, stats, 
                                        (every known colour still appears under "colors")
 GET  /api/data?color=Red&hours=0      one Tilt in detail (+50 recent readings); empty
                                        stats/series if that Tilt has no active batch
+POST /api/tilts                       {"action":"rename"|"forget","key":"Red-2","name":...}
+POST /api/thin                        {"days":7,"minutes":10,"dry_run":true|false}
+POST /api/thin/backup/delete          deletes tilt.jsonl.pre-thin.bak
 POST /api/batch                       {"action":"save"|"new"|"finish",
                                        "color":"Red","batch":{"name":...}}
 ```

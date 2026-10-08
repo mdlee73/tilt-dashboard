@@ -51,26 +51,196 @@ import json
 import os
 import re
 import sys
+import shutil
 import threading
 import uuid
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
+
+# ----------------------------------------------------------------------------
+# Tilt registry: tells two Tilts of the same colour apart
+# ----------------------------------------------------------------------------
+
+def base_color(key: str) -> str:
+    """"Red-2" -> "Red"; a plain colour is returned unchanged."""
+    head, sep, tail = (key or "").rpartition("-")
+    return head if sep and tail.isdigit() else (key or "")
+
+
+def tilt_label(key: str, names=None) -> str:
+    """Human label for a tilt key: its nickname if set, else "Red" / "Red #2"."""
+    nick = (names or {}).get(key)
+    if nick:
+        return nick
+    base = base_color(key)
+    return base if base == key else "%s #%s" % (base, key[len(base) + 1:])
+
+
+class TiltRegistry:
+    """Maps each physical Tilt (by Bluetooth address) to a stable "tilt key".
+
+    Every Tilt of one colour broadcasts the same colour UUID, so the colour
+    alone can't distinguish two of them -- but each advertisement also carries
+    the sender's address, which tilt_logger.py records as "address". The first
+    address seen for a colour takes slot 1 and keeps the plain colour name as
+    its key ("Red"), so everything that predates this feature (batches,
+    history, log lines with no address) is untouched. Further addresses get
+    "Red-2", "Red-3", ... Everything else in the dashboard treats that key
+    exactly like it always treated the colour.
+
+    Persisted beside the log as tilts.json:
+      {"devices": {"Red": {"AA:BB:..": 1, "CC:DD:..": 2}}, "names": {"Red-2": "Cyser"}}
+    """
+    MAX_NAME = 40
+
+    def __init__(self, path=None):
+        self.path = path
+        self._lock = threading.Lock()
+        self._devices = {}   # colour -> {ADDRESS: slot}
+        self._names = {}     # tilt key -> nickname
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for c, slots in (data.get("devices") or {}).items():
+                        if isinstance(slots, dict):
+                            self._devices[c] = {str(a).upper(): int(s) for a, s in slots.items()
+                                                if isinstance(s, int) and s >= 1}
+                    self._names = {str(k): str(v) for k, v in (data.get("names") or {}).items()
+                                   if str(v).strip()}
+            except (OSError, ValueError):
+                pass
+
+    @staticmethod
+    def _key(color: str, slot: int) -> str:
+        return color if slot == 1 else "%s-%d" % (color, slot)
+
+    def _save(self):
+        if not self.path:
+            return
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"devices": self._devices, "names": self._names}, f, indent=1)
+        os.replace(tmp, self.path)
+
+    def key_for(self, color: str, address) -> str:
+        """The tilt key for a reading of this colour from this address. A
+        reading with no address (older logger versions) is the primary Tilt."""
+        addr = (address or "").strip().upper() if isinstance(address, str) else ""
+        if not addr:
+            return color
+        with self._lock:
+            slots = self._devices.setdefault(color, {})
+            slot = slots.get(addr)
+            if slot is None:
+                used, slot = set(slots.values()), 1
+                while slot in used:
+                    slot += 1
+                slots[addr] = slot
+                self._save()
+            return self._key(color, slot)
+
+    def names(self) -> dict:
+        with self._lock:
+            return dict(self._names)
+
+    def set_name(self, key: str, name: str) -> bool:
+        name = (name or "").strip()[:self.MAX_NAME]
+        with self._lock:
+            if name:
+                self._names[key] = name
+            else:
+                self._names.pop(key, None)
+            self._save()
+            return True
+
+    def devices(self) -> list:
+        """[{key, color, address, slot, name}] for every address seen so far."""
+        with self._lock:
+            out = []
+            for color, slots in self._devices.items():
+                for addr, slot in slots.items():
+                    key = self._key(color, slot)
+                    out.append({"key": key, "color": color, "address": addr, "slot": slot,
+                                "name": self._names.get(key)})
+            return sorted(out, key=lambda d: (d["color"], d["slot"]))
+
+    def forget(self, key: str) -> bool:
+        """Release a device's slot (e.g. after replacing a dead Tilt) so a new
+        Tilt of that colour can take it over."""
+        with self._lock:
+            for color, slots in self._devices.items():
+                for addr, slot in list(slots.items()):
+                    if self._key(color, slot) == key:
+                        del slots[addr]
+                        self._names.pop(key, None)
+                        self._save()
+                        return True
+            return False
+
 
 # ----------------------------------------------------------------------------
 # Log reading with an incremental cache (cheap on a Pi even for big logs)
 # ----------------------------------------------------------------------------
 
+class _Series:
+    """One Tilt's readings as parallel lists, so the dashboard can slice a
+    time window with a binary search instead of scanning the whole log."""
+    __slots__ = ("recs", "ts", "temp", "sg", "ordered")
+
+    def __init__(self):
+        self.recs, self.ts, self.temp, self.sg = [], [], [], []
+        self.ordered = True   # timestamps non-decreasing (bisect is only valid then)
+
+    def add(self, rec):
+        if self.ts and rec[0] < self.ts[-1]:
+            self.ordered = False   # e.g. the Pi's clock stepped back after boot
+        # ts is appended last: readers size their slices from len(ts), so the
+        # other lists are always at least that long even mid-append
+        self.recs.append(rec)
+        self.temp.append(rec[2])
+        self.sg.append(rec[3])
+        self.ts.append(rec[0])
+
+
 class LogCache:
     """Parses the JSONL log once, then only reads newly appended bytes."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, tilts: "TiltRegistry" = None):
         self.path = path
+        self.tilts = tilts   # None = every reading keys on its colour alone
         self._lock = threading.Lock()
-        self._records = []   # list of (epoch_s, color, temp_f, sg, rssi, model, battery_weeks)
+        self._records = []   # list of (epoch_s, tilt key, temp_f, sg, rssi, model, battery_weeks)
         self._offset = 0
         self._size = -1
-        self._battery = {}   # colour -> (battery_weeks, epoch_s) for the latest report seen
+        self._battery = {}   # tilt key -> (battery_weeks, epoch_s) for the latest report seen
+        self._idx = {}       # tilt key -> _Series (same records, grouped per Tilt)
+        self._keymemo = {}   # (colour, address) -> tilt key (skips the registry lock per line)
+
+    def _reset(self):
+        self._records, self._offset, self._size = [], 0, -1
+        self._battery, self._idx, self._keymemo = {}, {}, {}
+
+    def _key_of(self, r: dict):
+        """Tilt key for one decoded log line: its colour, or "Colour-N" when
+        the line came from the 2nd+ Tilt of that colour."""
+        c = r.get("color")
+        if not (self.tilts and c):
+            return c
+        a = r.get("address")
+        try:
+            return self._keymemo[(c, a)]
+        except (KeyError, TypeError):
+            pass
+        k = self.tilts.key_for(c, a)
+        try:
+            self._keymemo[(c, a)] = k
+        except TypeError:
+            pass
+        return k
 
     def _parse_line(self, line: str):
         try:
@@ -81,7 +251,8 @@ class LogCache:
                 batt = int(batt) if batt is not None else None
             except (TypeError, ValueError):
                 batt = None
-            return (ts, r["color"], float(r["temp_f"]), float(r["sg"]),
+            r["color"]  # a line with no colour is malformed
+            return (ts, self._key_of(r), float(r["temp_f"]), float(r["sg"]),
                     r.get("rssi_dbm"), r.get("model", "standard"), batt)
         except (ValueError, KeyError, TypeError):
             return None  # skip malformed/partial lines
@@ -93,7 +264,7 @@ class LogCache:
             except OSError:
                 return []
             if size < self._size:          # rotated/truncated: reparse
-                self._records, self._offset, self._battery = [], 0, {}
+                self._reset()
             self._size = size
             if size > self._offset:
                 with open(self.path, "r", encoding="utf-8") as f:
@@ -104,10 +275,28 @@ class LogCache:
                     rec = self._parse_line(line)
                     if rec:
                         self._records.append(rec)
+                        ser = self._idx.get(rec[1])
+                        if ser is None:
+                            ser = self._idx[rec[1]] = _Series()
+                        ser.add(rec)
                         if rec[6] is not None:   # battery_weeks
                             self._battery[rec[1]] = (rec[6], rec[0])
                 self._offset += len(chunk[:end].encode("utf-8"))
             return self._records
+
+    def index(self):
+        """{tilt key: _Series}, brought up to date. Callers must not mutate it."""
+        self.records()
+        with self._lock:
+            return self._idx
+
+    def keys(self):
+        """Sorted tilt keys seen in the log (cheap: no scan of the readings)."""
+        return sorted(self.index())
+
+    def battery_for(self, key):
+        with self._lock:
+            return self._battery.get(key)
 
     def battery_by_color(self) -> dict:
         """{colour: {"weeks": int, "ts": epoch_s}} for the latest battery-age
@@ -131,7 +320,7 @@ class LogCache:
             kept, removed = [], 0
             for line in lines:
                 try:
-                    if json.loads(line).get("color") == color:
+                    if self._key_of(json.loads(line)) == color:
                         removed += 1
                         continue
                 except ValueError:
@@ -141,8 +330,135 @@ class LogCache:
             with open(tmp, "w", encoding="utf-8") as f:
                 f.writelines(kept)
             os.replace(tmp, self.path)
-            self._records, self._offset, self._size = [], 0, -1  # force reparse
+            self._reset()  # force reparse
             return removed
+
+    def thin(self, days: float, minutes: float, batches, dry_run: bool = True):
+        """Thin OLD readings: for readings older than `days`, keep one reading
+        per Tilt per `minutes`-minute bucket and drop the rest. Never removes:
+          * anything newer than the cutoff,
+          * a reading that carries a battery report,
+          * for every batch window, the first and last reading and the
+            highest and lowest temperature (so OG, final gravity and the
+            min/max stats don't change),
+          * any line that can't be parsed (left exactly as it is).
+        The old log is kept as <log>.pre-thin.bak. Returns a summary dict;
+        dry_run=True only reports what would happen.
+
+        Streams the file (one pass to decide, one to write) so a log of
+        hundreds of MB never has to fit in memory -- important on a Pi."""
+        width = max(float(minutes), 1.0) * 60.0
+        cutoff = datetime.now(timezone.utc).timestamp() - float(days) * 86400.0
+        wins = [(b["color"], b["start_ts"], b.get("end_ts") or float("inf"))
+                for b in batches if b.get("start_ts") is not None]
+        with self._lock:
+            try:
+                size0 = os.path.getsize(self.path)
+            except OSError:
+                return {"error": "can't read the log"}
+            keep = bytearray()          # one byte per complete line: 1 = keep
+            seen = set()                # (tilt key, time bucket) already represented
+            prot = {}                   # (batch idx, what) -> (value, line idx, line bytes)
+            consumed = old_lines = removed_bytes = 0
+            try:
+                with open(self.path, "rb") as f:
+                    for line in f:
+                        if consumed + len(line) > size0 or not line.endswith(b"\n"):
+                            break       # only whole lines that existed when we started
+                        n = len(keep)
+                        consumed += len(line)
+                        keep.append(1)
+                        try:
+                            r = json.loads(line)
+                            ts = datetime.fromisoformat(r["timestamp"]).timestamp()
+                            key = self._key_of(r)
+                            temp = float(r["temp_f"])
+                            r["color"]
+                        except (ValueError, KeyError, TypeError):
+                            continue                   # unparseable: keep untouched
+                        if ts >= cutoff:
+                            continue
+                        old_lines += 1
+                        bucket = (key, int(ts // width))
+                        if r.get("battery_weeks") is None and bucket in seen:
+                            keep[n] = 0
+                            removed_bytes += len(line)
+                        else:
+                            seen.add(bucket)           # first of its bucket / a battery report
+                        for bi, (bc, s0, e0) in enumerate(wins):
+                            if bc == key and s0 <= ts <= e0:
+                                for what, val, better in (("first", ts, lambda x, y: x < y),
+                                                          ("last", ts, lambda x, y: x > y),
+                                                          ("min", temp, lambda x, y: x < y),
+                                                          ("max", temp, lambda x, y: x > y)):
+                                    cur = prot.get((bi, what))
+                                    if cur is None or better(val, cur[0]):
+                                        prot[(bi, what)] = (val, n, len(line))
+            except OSError:
+                return {"error": "can't read the log"}
+            for _, n, ln in prot.values():
+                if not keep[n]:
+                    keep[n] = 1
+                    removed_bytes -= ln
+            lines_before = len(keep)
+            removed = lines_before - sum(keep)
+            result = {
+                "lines_before": lines_before, "lines_after": lines_before - removed,
+                "old_lines": old_lines, "removed": removed,
+                "bytes_before": size0, "bytes_after": size0 - removed_bytes,
+                "dry_run": bool(dry_run),
+            }
+            if dry_run or not removed:
+                return result
+            try:
+                free = shutil.disk_usage(os.path.dirname(os.path.abspath(self.path))).free
+                if free < (size0 + result["bytes_after"]) * 1.1 + 5_000_000:
+                    return {"error": "not enough free disk space to thin safely "
+                            "(a backup of the old log is kept alongside it)"}
+            except OSError:
+                pass
+            backup = self.path + ".pre-thin.bak"
+            tmp = self.path + ".thin.tmp"
+            try:
+                shutil.copy2(self.path, backup)
+                with open(self.path, "rb") as src, open(tmp, "wb") as out:
+                    for i in range(lines_before):
+                        line = src.readline()
+                        if keep[i]:
+                            out.write(line)
+                    # whatever follows: a partial last line and anything the
+                    # logger appended while we worked
+                    out.write(src.read())
+                os.replace(tmp, self.path)
+            except OSError as e:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return {"error": "thinning failed (%s); the log was left unchanged" % e}
+            self._reset()                              # force a clean reparse
+            result["backup"] = backup
+            return result
+
+    def thin_backup_info(self):
+        """{"path","bytes","ts"} for the .pre-thin.bak file, or None."""
+        bp = self.path + ".pre-thin.bak"
+        try:
+            st = os.stat(bp)
+        except OSError:
+            return None
+        return {"path": bp, "bytes": st.st_size, "ts": round(st.st_mtime)}
+
+    def delete_thin_backup(self) -> int:
+        """Delete the .pre-thin.bak file (and only that file). Returns bytes freed."""
+        bp = self.path + ".pre-thin.bak"
+        with self._lock:
+            try:
+                n = os.path.getsize(bp)
+                os.remove(bp)
+                return n
+            except OSError:
+                return -1
 
     def purge_window(self, color: str, start_ts: float, end_ts) -> int:
         """Physically remove just ONE batch's readings: one colour, bounded
@@ -165,7 +481,7 @@ class LogCache:
             for line in lines:
                 try:
                     r = json.loads(line)
-                    if r.get("color") == color:
+                    if self._key_of(r) == color:
                         ts = datetime.fromisoformat(r["timestamp"]).timestamp()
                         if start_ts <= ts <= end:
                             removed += 1
@@ -177,7 +493,7 @@ class LogCache:
             with open(tmp, "w", encoding="utf-8") as f:
                 f.writelines(kept)
             os.replace(tmp, self.path)
-            self._records, self._offset, self._size = [], 0, -1  # force reparse
+            self._reset()  # force reparse
             return removed
 
 
@@ -548,6 +864,10 @@ class BatchStore:
                 self._batches = data["batches"]
         except (OSError, ValueError):
             pass
+
+    def all_batches(self):
+        with self._lock:
+            return [dict(b) for b in self._batches]
 
     def _save(self):
         tmp = self.path + ".tmp"
@@ -1098,17 +1418,125 @@ def tilt_summary(mine, batch, hours, now):
     }
 
 
+def _window_idx(ser, batch):
+    """[i, j) slice of a (time-ordered) series that belongs to the batch."""
+    if not batch:
+        return 0, len(ser.ts)
+    s, e = batch["start_ts"], batch.get("end_ts")
+    i = bisect_left(ser.ts, s)
+    j = bisect_right(ser.ts, e) if e else len(ser.ts)
+    return i, max(i, j)
+
+
+def _downsample_ser(ser, i, j, max_buckets=400):
+    """downsample() over ser[i:j], but bucket edges are found by binary search
+    and the means are taken with C-speed slice sums: O(buckets*log n + n) with
+    a tiny constant, instead of a Python loop over every reading. Same bucket
+    assignment as downsample() (it reuses its exact index formula)."""
+    n = j - i
+    if n <= 0:
+        return []
+    ts, temp, sg = ser.ts, ser.temp, ser.sg
+    if n <= max_buckets:
+        return [{"t": round(ts[k]), "temp": round(temp[k], 2), "sg": round(sg[k], 4)}
+                for k in range(i, j)]
+    t0, t1 = ts[i], ts[j - 1]
+    span = max(t1 - t0, 1)
+    last = max_buckets - 1
+
+    def bucket(k):
+        return min(int((ts[k] - t0) / span * max_buckets), last)
+
+    starts = [i]
+    lo = i
+    for b in range(1, max_buckets):
+        a, z = lo, j          # first index whose bucket >= b
+        while a < z:
+            m = (a + z) // 2
+            if bucket(m) >= b:
+                z = m
+            else:
+                a = m + 1
+        starts.append(a)
+        lo = a
+    starts.append(j)
+    out = []
+    for b in range(max_buckets):
+        a, z = starts[b], starts[b + 1]
+        c = z - a
+        if c:
+            out.append({"t": round(sum(ts[a:z]) / c),
+                        "temp": round(sum(temp[a:z]) / c, 2),
+                        "sg": round(sum(sg[a:z]) / c, 4)})
+    return out
+
+
+def tilt_summary_ser(cache, key, ser, batch, hours, now):
+    """tilt_summary() computed from the per-Tilt index (identical output)."""
+    i, j = _window_idx(ser, batch)
+    n = j - i
+    stats = None
+    if n:
+        recs = ser.recs
+        og = (batch or {}).get("og_override") or ser.sg[i]
+        last = recs[j - 1]
+        sg, temp_f = last[3], last[2]
+        abv = max((og - sg) * 131.25, 0.0)
+        atten = ((og - sg) / (og - 1.0) * 100.0) if og > 1.0 else 0.0
+        tw = ser.temp[i:j]
+        batt_w = batt_ts = None
+        if not (batch or {}).get("end_ts"):
+            # open-ended window: the newest battery report seen for this Tilt
+            # is the newest one in the window, if it falls inside it
+            bt = cache.battery_for(key)
+            if bt and bt[1] >= ser.ts[i]:
+                batt_w, batt_ts = bt[0], round(bt[1])
+        else:
+            for k in range(j - 1, i - 1, -1):
+                if recs[k][6] is not None:
+                    batt_w, batt_ts = recs[k][6], round(recs[k][0])
+                    break
+        k24 = bisect_left(ser.ts, last[0] - 86400, i, j)
+        stats = {
+            "sg": sg, "temp_f": temp_f,
+            "temp_c": round((temp_f - 32) * 5 / 9, 2),
+            "og": round(og, 4), "abv": round(abv, 2),
+            "attenuation": round(atten, 1),
+            "temp_min": round(min(tw), 1), "temp_max": round(max(tw), 1),
+            "n": n,
+            "last_seen": round(last[0]), "rssi": last[4],
+            "first_ts": round(ser.ts[i]),
+            "sg_24h_ago": ser.sg[k24] if k24 < j else None,
+            "battery_weeks": batt_w,
+            "battery_ts": batt_ts,
+        }
+    si = i
+    if hours and hours > 0:
+        si = max(i, bisect_left(ser.ts, now - hours * 3600, i, j))
+    return {
+        "model": ser.recs[-1][5] if ser.recs else "standard",
+        "batch": batch,
+        "stats": stats,
+        "series": _downsample_ser(ser, si, j),
+        "n_total": n,
+        "last_reading": round(ser.recs[-1][0]) if ser.recs else None,
+    }
+
+
 def build_overview(cache: LogCache, store: BatchStore, hours: float):
-    recs = cache.records()
+    idx = cache.index()
     now = datetime.now(timezone.utc).timestamp()
-    colors = sorted({r[1] for r in recs})
+    colors = sorted(idx)
     tilts = []
     for c in colors:
         batch = store.active(c)
         if batch is None:
             continue  # no active batch: keep the colour tab, but no overview card/chart
-        mine = [r for r in recs if r[1] == c]
-        t = tilt_summary(mine, batch, hours, now)
+        ser = idx[c]
+        if ser.ordered:
+            t = tilt_summary_ser(cache, c, ser, batch, hours, now)
+        else:   # clock stepped backwards at some point: use the order-agnostic path
+            t = tilt_summary(ser.recs, batch, hours, now)
         t["color"] = c
         tilts.append(t)
     return {"colors": colors, "tilts": tilts, "server_time": round(now)}
@@ -1116,9 +1544,9 @@ def build_overview(cache: LogCache, store: BatchStore, hours: float):
 
 def build_detail(cache: LogCache, store: BatchStore, hours: float,
                  color=None, batch_id=None):
-    recs = cache.records()
+    idx = cache.index()
     now = datetime.now(timezone.utc).timestamp()
-    colors = sorted({r[1] for r in recs})
+    colors = sorted(idx)
     batch = None
     if batch_id:
         batch = store.by_id(batch_id)
@@ -1134,24 +1562,29 @@ def build_detail(cache: LogCache, store: BatchStore, hours: float,
         if color not in colors:
             color = colors[0]
         batch = store.active(color)
-    mine = [r for r in recs if r[1] == color]
+    ser = idx.get(color)
+    mine = ser.recs if ser else []
     if batch_id is None and batch is None:
         # Live view, no current batch: once a batch finishes (or before one is
         # ever started) its readings only live in History, so show an empty
         # state here instead of falling back to all-time data.
         out = {"model": mine[-1][5] if mine else "standard", "batch": None,
                "stats": None, "series": [], "n_total": 0}
-        wrecs = []
+        recent = []
+    elif ser is not None and ser.ordered:
+        out = tilt_summary_ser(cache, color, ser, batch, hours, now)
+        i, j = _window_idx(ser, batch)
+        recent = ser.recs[max(i, j - 50):j]
     else:
         out = tilt_summary(mine, batch, hours, now)
-        wrecs = batch_window(mine, batch)
+        recent = batch_window(mine, batch)[-50:]
     if out["stats"] is None and batch and batch.get("snapshot"):
         out["stats"] = batch["snapshot"]   # data purged/rotated: use snapshot
     out.update({
         "colors": colors, "color": color,
         "finished": bool(batch and batch.get("end_ts")),
         "recent": [{"t": round(r[0]), "temp": r[2], "sg": r[3], "rssi": r[4]}
-                   for r in wrecs[-50:]][::-1],
+                   for r in recent][::-1],
         "server_time": round(now),
     })
     return out
@@ -1324,10 +1757,11 @@ def build_report(cache, store, color=None, batch_id=None, brand=None):
     model = d.get("model", "standard")
     nd = 4 if model == "pro" else 3
     fsg = lambda v: ("%." + str(nd) + "f") % v
-    name = esc(b.get("name") or (d["color"] + " Tilt batch"))
+    tlabel = tilt_label(d["color"], cache.tilts.names() if getattr(cache, "tilts", None) else None)
+    name = esc(b.get("name") or (tlabel + " Tilt batch"))
     hue = {"Red": "#c23837", "Green": "#006300", "Black": "#5d5340",
            "Purple": "#4a3aa7", "Orange": "#c2521f", "Blue": "#1c5cab",
-           "Yellow": "#8a6a00", "Pink": "#b04070"}.get(d["color"], "#1c5cab")
+           "Yellow": "#8a6a00", "Pink": "#b04070"}.get(base_color(d["color"]), "#1c5cab")
 
     meta = []
     def m(label, val):
@@ -1337,7 +1771,7 @@ def build_report(cache, store, color=None, batch_id=None, brand=None):
     fmt_d = lambda ts: datetime.fromtimestamp(ts).strftime("%b %d, %Y %H:%M")
     start = b.get("start_ts") or (S and S.get("first_ts"))
     end = b.get("end_ts")
-    m("Tilt", esc(d["color"]) + (" Pro" if model == "pro" else ""))
+    m("Tilt", esc(tlabel) + (" Pro" if model == "pro" else ""))
     m("Style", esc(b.get("style") or ""))
     m("Yeast", esc(b.get("yeast") or ""))
     m("Batch size", esc(b.get("batch_size") or ""))
@@ -1425,7 +1859,7 @@ def build_report(cache, store, color=None, batch_id=None, brand=None):
             % (esc(datetime.fromtimestamp(a["ts"]).strftime("%b %d, %Y %H:%M")), esc(a["text"]))
             for a in sorted(anns, key=lambda a: a["ts"]))
         notes += "<h2>Chart notes</h2><div class='notes'>%s</div>" % rows
-    csv_q = ("id=" + b["id"]) if b.get("id") else ("color=" + d["color"])
+    csv_q = ("id=" + b["id"]) if b.get("id") else ("color=" + quote(d["color"], safe=""))
     gen = datetime.now().strftime("%b %d, %Y %H:%M")
 
     return REPORT_TMPL % {
@@ -1586,6 +2020,7 @@ class Handler(BaseHTTPRequestHandler):
     recipe: RecipeStore = None
     stages: StageStore = None
     drafts: DraftStore = None
+    tilts: TiltRegistry = None  # which physical Tilt is which (same-colour support)
     allow_updates = False       # web-based software updates (--allow-updates)
 
     def _send(self, code, body: bytes, ctype: str, extra=None):
@@ -1623,17 +2058,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif url.path == "/api/overview":
             self._json({**build_overview(self.cache, self.store, hours),
-                        "battery": self.cache.battery_by_color()})
+                        "battery": self.cache.battery_by_color(),
+                        "tilt_names": self.tilts.names()})
         elif url.path == "/api/data":
             self._json({**build_detail(self.cache, self.store, hours,
                                        color=color, batch_id=batch_id),
-                        "battery": self.cache.battery_by_color()})
+                        "battery": self.cache.battery_by_color(),
+                        "tilt_names": self.tilts.names()})
         elif url.path == "/api/history":
             self._json({**build_history(self.cache, self.store),
-                        "battery": self.cache.battery_by_color()})
+                        "battery": self.cache.battery_by_color(),
+                        "tilt_names": self.tilts.names()})
         elif url.path == "/api/admin":
             self._json({**self._admin_payload(),
-                        "battery": self.cache.battery_by_color()})
+                        "battery": self.cache.battery_by_color(),
+                        "tilt_names": self.tilts.names()})
         elif url.path == "/guide":
             self._send(200, _with_brand(GUIDE, self.brand.get()).encode("utf-8"),
                        "text/html; charset=utf-8")
@@ -1673,12 +2112,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def _admin_payload(self):
-        recs = self.cache.records()
+        idx = self.cache.index()
         now = datetime.now(timezone.utc).timestamp()
-        colors = sorted({r[1] for r in recs})
+        colors = sorted(idx)
         tilts = []
         for c in colors:
-            mine = [r for r in recs if r[1] == c]
+            mine = idx[c].recs
             tilts.append({"color": c, "n": len(mine),
                           "first_ts": round(mine[0][0]),
                           "last_ts": round(mine[-1][0])})
@@ -1691,7 +2130,9 @@ class Handler(BaseHTTPRequestHandler):
         mt = lambda p: round(os.path.getmtime(p)) if os.path.exists(p) else None
         return {
             "colors": colors, "tilts": tilts,
+            "devices": self.tilts.devices(),
             "log": {"path": self.cache.path, "bytes": log_bytes},
+            "thin_backup": self.cache.thin_backup_info(),
             "batches_path": self.store.path,
             "interval": self.settings.get()["interval"],
             "allow_updates": self.allow_updates,
@@ -1737,6 +2178,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad request"}, 400)
             return self._json({"ok": True, **self.brand.set(name, tagline)})
 
+        if url.path == "/api/tilts":
+            body = self._read_body(4096) or {}
+            key = body.get("key")
+            action = body.get("action")
+            known = {d["key"] for d in self.tilts.devices()}
+            if not isinstance(key, str) or key not in known:
+                return self._json({"error": "unknown Tilt"}, 404)
+            if action == "rename":
+                name = body.get("name", "")
+                if not isinstance(name, str):
+                    return self._json({"error": "bad request"}, 400)
+                self.tilts.set_name(key, name)
+                return self._json({"ok": True, "tilt_names": self.tilts.names()})
+            if action == "forget":
+                # Only safe once this Tilt has no readings left in the log (use
+                # "Reset Tilt" first): otherwise re-reading those lines would
+                # simply register the same address all over again.
+                if self.cache.index().get(key) is not None:
+                    return self._json({"error": "this Tilt still has readings in the "
+                                       "log -- use Reset Tilt first"}, 409)
+                self.tilts.forget(key)
+                return self._json({"ok": True, "tilt_names": self.tilts.names()})
+            return self._json({"error": "unknown action"}, 400)
+
         if url.path == "/api/reset":
             body = self._read_body(4096)
             color = (body or {}).get("color")
@@ -1746,6 +2211,24 @@ class Handler(BaseHTTPRequestHandler):
             deleted = self.store.delete_active(color)
             return self._json({"ok": True, "readings_removed": removed,
                                "batch_deleted": bool(deleted)})
+
+        if url.path == "/api/thin/backup/delete":
+            freed = self.cache.delete_thin_backup()
+            if freed < 0:
+                return self._json({"error": "no backup file to delete"}, 404)
+            return self._json({"ok": True, "freed": freed})
+
+        if url.path == "/api/thin":
+            body = self._read_body(4096) or {}
+            try:
+                days = float(body.get("days", 7)); minutes = float(body.get("minutes", 10))
+            except (TypeError, ValueError):
+                return self._json({"error": "bad request"}, 400)
+            if not (1 <= days <= 3650) or not (1 <= minutes <= 120):
+                return self._json({"error": "bad request"}, 400)
+            res = self.cache.thin(days, minutes, self.store.all_batches(),
+                                  dry_run=bool(body.get("dry_run", True)))
+            return self._json(res, 500 if "error" in res else 200)
 
         if url.path == "/api/archive/trim":
             body = self._read_body(4096)
@@ -1939,8 +2422,8 @@ class Handler(BaseHTTPRequestHandler):
             fields = body.get("batch") or {}
             if not isinstance(fields, dict) or not isinstance(color, str):
                 return self._json({"error": "bad request"}, 400)
-            recs = self.cache.records()
-            mine = [r for r in recs if r[1] == color]
+            ser = self.cache.index().get(color)
+            mine = ser.recs if ser else []
             if not mine and action != "save":
                 return self._json({"error": "unknown tilt colour"}, 400)
 
@@ -2254,6 +2737,15 @@ PAGE = r"""<!DOCTYPE html>
   .ahint code { font-family:ui-monospace,monospace; font-size:11.5px; }
   .ainfo { font-size:12.5px; color:var(--ink-2); margin-top:8px; }
   .ainfo2 { font-size:12px; color:var(--muted); min-width:150px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--border);
+             border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite;
+             vertical-align:-2px; margin-right:8px; }
+  .thinstatus { font-size:13px; margin-top:10px; padding:9px 12px; border-radius:8px;
+                background:var(--page); border:1px solid var(--border); color:var(--ink); }
+  #thinBackupRow[hidden], .thinstatus[hidden] { display:none; }  /* .arow's display:flex would otherwise win */
+  .thinstatus.ok { border-color:var(--olive); }
+  .thinstatus.err { border-color:#b3452f; color:#b3452f; }
   #vAdmin input[type=file] { font-size:12.5px; color:var(--ink-2); max-width:230px; }
   #vAdmin td .btn { padding:3px 10px; font-size:12.5px; }
 </style>
@@ -2339,6 +2831,35 @@ PAGE = r"""<!DOCTYPE html>
     <div class="ahint" style="margin:8px 0 6px">Reset erases a Tilt's logged readings and its
       current batch so the next brew starts clean. Finished batch summaries stay in History
       — export any reports you want to keep first.</div>
+  </div>
+
+  <div class="card"><h2>Thin old data</h2>
+    <div class="ahint" style="margin-bottom:8px">A long-running log makes the dashboard slow.
+      This shrinks <b>old</b> readings to one per Tilt every few minutes. Your batches
+      (names, recipes, notes, brew dates, stage markers, History summaries) are not touched,
+      and each batch keeps its first and last reading and its highest and lowest
+      temperature, so OG and the min/max stats stay the same. Older charts just have fewer
+      points. You'll see exactly what will change before anything is removed, and the
+      previous log is kept as a backup file next to it.</div>
+    <div class="arow">
+      <label for="thinDays">Older than</label>
+      <select id="thinDays">
+        <option value="1">1 day</option><option value="2">2 days</option>
+        <option value="3">3 days</option><option value="7" selected>7 days</option>
+        <option value="14">14 days</option><option value="30">30 days</option>
+      </select>
+      <label for="thinMin" style="margin-left:10px">keep one reading every</label>
+      <select id="thinMin">
+        <option value="5">5 minutes</option><option value="10" selected>10 minutes</option>
+        <option value="15">15 minutes</option><option value="30">30 minutes</option>
+      </select>
+      <button class="btn" id="thinBtn" style="margin-left:10px">Thin old data…</button>
+    </div>
+    <div class="thinstatus" id="thinStatus" hidden></div>
+    <div class="arow" id="thinBackupRow" style="margin-top:10px" hidden>
+      <span class="ainfo2" id="thinBackupInfo" style="min-width:0;flex:1"></span>
+      <button class="btn danger" id="thinDelBtn">Delete backup</button>
+    </div>
   </div>
 
   <div class="card"><h2>Recipe wheels</h2>
@@ -2517,7 +3038,27 @@ const TILT_HUES = {
   Orange:{l:"#eb6834",d:"#d95926"}, Blue:{l:"#2a78d6",d:"#3987e5"},
   Yellow:{l:"#eda100",d:"#c98500"}, Pink:{l:"#e87ba4",d:"#d55181"},
 };
-const hue = c => (TILT_HUES[c] || {l:"#2a78d6",d:"#3987e5"})[darkMq.matches ? "d" : "l"];
+/* Tilt identity: a "tilt key" is the colour ("Red") or, for the 2nd+ Tilt of
+   the same colour, "Red-2". Labels show a nickname if one is set in Admin. */
+let tiltNames = {};   // key -> nickname (refreshed with every API response)
+const baseColor = k => String(k).replace(/-\d+$/, "");
+const tiltLabel = k => {
+  if (tiltNames[k]) return tiltNames[k];
+  const b = baseColor(k);
+  return b === k ? k : b + " #" + k.slice(b.length + 1);
+};
+function mixWhite(hex, f) {
+  const n = parseInt(hex.slice(1), 16);
+  const m = v => Math.round(v + (255 - v) * f).toString(16).padStart(2, "0");
+  return "#" + m((n >> 16) & 255) + m((n >> 8) & 255) + m(n & 255);
+}
+/* Same-colour Tilts get progressively lighter shades so their lines and dots
+   stay tell-apart-able on the combined charts. */
+const hue = c => {
+  const b = baseColor(c);
+  const h = (TILT_HUES[b] || {l:"#2a78d6",d:"#3987e5"})[darkMq.matches ? "d" : "l"];
+  return b === c ? h : mixWhite(h, Math.min(0.30 + 0.18 * (Number(c.slice(b.length + 1)) - 2), 0.72));
+};
 
 let state = { view:"all", pastId:null, hours:0, data:null,
               histSelect:false, selIds:new Set() };
@@ -2633,6 +3174,7 @@ async function load(spin) {
     else if (state.view === "admin") url = "/api/admin";
     else url = "/api/data?hours=" + state.hours + "&color=" + encodeURIComponent(state.view);
     state.data = await (await fetch(url)).json();
+    if (state.data && state.data.tilt_names) tiltNames = state.data.tilt_names;
     render();
   } catch (e) { $("sub").textContent = "connection lost — retrying…"; }
   for (const c of document.querySelectorAll(".card.chart")) c.classList.remove("loading");
@@ -2641,7 +3183,7 @@ async function load(spin) {
 /* ---------- navigation ---------- */
 function buildNav(colors, battery) {
   const nav = $("nav");
-  const want = ["all", ...colors, "history"].join("|");
+  const want = ["all", ...colors.map(c => c + "=" + tiltLabel(c)), "history"].join("|");
   if (nav.dataset.built !== want) {
     nav.dataset.built = want;
     nav.textContent = "";
@@ -2670,7 +3212,7 @@ function buildNav(colors, battery) {
       nav.append(b);
     };
     mk("All Tilts", "all", null);
-    for (const c of colors) mk(c, c, hue(c));
+    for (const c of colors) mk(tiltLabel(c), c, hue(c));
     mk("History", "history", null);
     mk("Admin", "admin", null);
   }
@@ -2747,7 +3289,7 @@ function renderAll(D) {
     }
     const who = el(c, "div", "who");
     const d = el(who, "span", "dot"); d.style.background = hue(t.color);
-    el(who, "span", null, t.color + " Tilt" + (t.model === "pro" ? " Pro" : ""));
+    el(who, "span", null, tiltLabel(t.color) + " Tilt" + (t.model === "pro" ? " Pro" : ""));
     const cardBatt = battByColor[t.color];
     if (cardBatt && cardBatt.weeks != null) {
       const bb = el(who, "span", "cardbatt");
@@ -2784,14 +3326,14 @@ function renderAll(D) {
   }
 
   const defs = key => D.tilts.filter(t => t.series.length).map(t => ({
-    label: batchTitle(t.batch) === "Unnamed batch" ? t.color : batchTitle(t.batch),
-    sub: t.color, color: hue(t.color), model: t.model,
+    label: batchTitle(t.batch) === "Unnamed batch" ? tiltLabel(t.color) : batchTitle(t.batch),
+    sub: tiltLabel(t.color), color: hue(t.color), model: t.model,
     pts: t.series.map(p => ({ t: p.t, v: p[key] })),
   }));
   const sgDefs = defs("sg"), tDefs = defs("temp");
   const abvDefs = D.tilts.filter(t => t.series.length && t.stats).map(t => ({
-    label: batchTitle(t.batch) === "Unnamed batch" ? t.color : batchTitle(t.batch),
-    sub: t.color, color: hue(t.color), model: t.model,
+    label: batchTitle(t.batch) === "Unnamed batch" ? tiltLabel(t.color) : batchTitle(t.batch),
+    sub: tiltLabel(t.color), color: hue(t.color), model: t.model,
     pts: t.series.map(p => ({ t: p.t, v: abvAt(t.stats.og, p.sg) })),
   }));
   legend("sgLegend", sgDefs); legend("abvLegend", abvDefs); legend("tLegend", tDefs);
@@ -2855,7 +3397,7 @@ function renderHist(D) {
     if (b.image) { const im = el(c, "img", "bimg"); im.src = b.image; im.alt = ""; }
     const who = el(c, "div", "who");
     const d = el(who, "span", "dot"); d.style.background = hue(b.color);
-    who.append(b.color + " Tilt");
+    who.append(tiltLabel(b.color) + " Tilt");
     el(c, "div", "bname", b.name);
     const days = ((b.end_ts - b.start_ts) / 86400).toFixed(1);
     el(c, "div", "bmeta", [b.style, fmtDate(b.start_ts) + " – " + fmtDate(b.end_ts),
@@ -2878,7 +3420,7 @@ function renderHist(D) {
 function renderOne(D) {
   const S = D.stats, b = D.batch, now = D.server_time;
   const finished = D.finished;
-  $("sub").textContent = D.color + " Tilt (" + (D.model === "pro" ? "Pro" : "standard") + ")" +
+  $("sub").textContent = tiltLabel(D.color) + " Tilt (" + (D.model === "pro" ? "Pro" : "standard") + ")" +
     (S ? " · " + (D.n_total || 0).toLocaleString() + " readings this batch" +
          (finished ? "" : " · updated " + ago(S.last_seen, now)) : "");
 
@@ -3033,9 +3575,98 @@ async function deleteSelectedBrews() {
   } catch (e) { alert("Delete failed — is the dashboard server still running?"); }
 }
 
+/* ---------- Tilt nicknames / forgetting a replaced Tilt (Admin) ---------- */
+async function tiltAction(body) {
+  try {
+    const r = await fetch("/api/tilts", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!r.ok) { alert(j.error || "That didn't work."); return; }
+    load(true);
+  } catch (e) { alert("Could not reach the dashboard server."); }
+}
+
+/* ---------- thin old data (Admin) ---------- */
+function thinStatus(kind, html) {
+  const el = $("thinStatus");
+  el.className = "thinstatus" + (kind === "ok" ? " ok" : kind === "err" ? " err" : "");
+  el.hidden = !html; el.textContent = "";
+  if (!html) return;
+  if (kind === "busy") { const sp = document.createElement("span"); sp.className = "spinner"; el.append(sp); }
+  el.append(document.createTextNode(html));
+}
+let thinTimer = null;
+function thinBusy(label) {   // spinner + elapsed seconds so a long job is visibly alive
+  const t0 = Date.now();
+  const tick = () => thinStatus("busy", label + " " + Math.round((Date.now() - t0) / 1000) + " s" +
+    " — please keep this page open");
+  tick(); clearInterval(thinTimer); thinTimer = setInterval(tick, 500);
+}
+function thinDone() { clearInterval(thinTimer); thinTimer = null; }
+
+function renderThinBackup(D) {
+  const bk = D.thin_backup;
+  $("thinBackupRow").hidden = !bk;
+  if (bk) $("thinBackupInfo").textContent = "Backup of the log from before thinning: " + bk.path +
+    " · " + (bk.bytes / 1048576).toFixed(1) + " MB · saved " + new Date(bk.ts * 1000).toLocaleString([],
+    { month:"short", day:"numeric", hour:"numeric", minute:"2-digit" });
+}
+
+async function deleteThinBackup() {
+  if (!confirm("Permanently delete the backup of the log from before thinning?\n\n" +
+      "Only do this once you've checked your charts and batches look right. This cannot be undone."))
+    return;
+  $("thinDelBtn").disabled = true;
+  try {
+    const r = await fetch("/api/thin/backup/delete", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: "{}" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "failed");
+    thinStatus("ok", "Backup deleted — freed " + (j.freed / 1048576).toFixed(1) + " MB.");
+    load(true);
+  } catch (e) { thinStatus("err", "Could not delete the backup: " + e.message); }
+  finally { $("thinDelBtn").disabled = false; }
+}
+
+async function thinOldData() {
+  const days = parseFloat($("thinDays").value), minutes = parseFloat($("thinMin").value);
+  const post = async dry => {
+    const r = await fetch("/api/thin", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ days, minutes, dry_run: dry }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "failed");
+    return j;
+  };
+  const mb = b => (b / 1048576).toFixed(1) + " MB";
+  const btn = $("thinBtn"); btn.disabled = true;
+  try {
+    thinBusy("Checking the log…");
+    const p = await post(true);
+    thinDone();
+    if (!p.removed) { thinStatus("ok", "Nothing to thin: no readings older than " + days +
+      " days beyond what would be kept."); return; }
+    thinStatus("", "");
+    if (!confirm("Thin readings older than " + days + " days to one every " + minutes +
+        " minutes?\n\nRemoves " + p.removed.toLocaleString() + " of " +
+        p.lines_before.toLocaleString() + " readings (" + mb(p.bytes_before) + " → about " +
+        mb(p.bytes_after) + ").\n\nBatches, notes and History are not changed. The current log " +
+        "is first saved as a .pre-thin.bak backup beside it."))
+      return;
+    thinBusy("Thinning " + p.removed.toLocaleString() + " readings and saving a backup…");
+    const j = await post(false);
+    thinDone();
+    thinStatus("ok", "Done — removed " + j.removed.toLocaleString() + " readings (" +
+      j.lines_before.toLocaleString() + " → " + j.lines_after.toLocaleString() + "); the log is now " +
+      mb(j.bytes_after) + ". Check your charts, then delete the backup below to free the space.");
+    load(true);
+  } catch (e) { thinDone(); thinStatus("err", "Thinning failed: " + e.message); }
+  finally { thinDone(); btn.disabled = false; }
+}
+
 /* ---------- reset ---------- */
 async function resetTilt(color) {
-  if (!confirm("Erase ALL logged readings for the " + color + " Tilt and delete its " +
+  if (!confirm("Erase ALL logged readings for the " + tiltLabel(color) + " Tilt and delete its " +
       "current batch?\n\nFinished batch summaries stay in History, but their charts " +
       "and reports lose their data — export any reports you want to keep first.\n\n" +
       "This cannot be undone."))
@@ -3047,7 +3678,7 @@ async function resetTilt(color) {
     const j = await r.json();
     if (!r.ok) throw new Error();
     alert("Erased " + (j.readings_removed || 0).toLocaleString() + " readings for the "
-          + color + " Tilt. New readings will start a fresh brew.");
+          + tiltLabel(color) + " Tilt. New readings will start a fresh brew.");
     state.view = "all"; state.pastId = null; syncNav(); load(true);
   } catch (e) { alert("Reset failed — is the dashboard server still running?"); }
 }
@@ -3056,7 +3687,7 @@ async function resetTilt(color) {
 async function trimBatch(b) {
   const range = (b.start_ts ? fmtDate(b.start_ts) : "?") + " – " + (b.end_ts ? fmtDate(b.end_ts) : "?");
   if (!confirm("Permanently remove the raw logged readings for “" + batchTitle(b) + "” (" +
-      b.color + " Tilt, " + range + ") from the server?\n\nThe History summary, stats and image " +
+      tiltLabel(b.color) + " Tilt, " + range + ") from the server?\n\nThe History summary, stats and image " +
       "stay — only the detailed charts, table and CSV data for this batch go away. Download an " +
       "archive first if you want to keep the full data.\n\nThis cannot be undone."))
     return;
@@ -3320,7 +3951,7 @@ async function openRebrewHistoryPicker(destColor) {
     alert("No finished brews in History yet to rebrew from.");
     return;
   }
-  const box = openPicker("Rebrew " + destColor + " Tilt from history");
+  const box = openPicker("Rebrew " + tiltLabel(destColor) + " Tilt from history");
   el(box, "div", "bmeta", "Pick a past brew to use as a starting point:");
   const sel = el(box, "select");
   sel.style.cssText = "width:100%;font:inherit;font-size:13.5px;color:var(--ink);" +
@@ -3329,7 +3960,7 @@ async function openRebrewHistoryPicker(destColor) {
   for (const b of batches) {
     const o = document.createElement("option");
     o.value = b.id;
-    o.textContent = b.color + " · " + (b.name || "Unnamed batch") +
+    o.textContent = tiltLabel(b.color) + " · " + (b.name || "Unnamed batch") +
       (b.style ? " (" + b.style + ")" : "") + " · " + fmtDate(b.end_ts) +
       (b.trimmed ? " · trimmed" : "");
     sel.append(o);
@@ -3395,34 +4026,70 @@ function renderAdmin(D) {
   if ([...sel.options].some(o => o.value === v)) sel.value = v;
   else { const o = document.createElement("option");
     o.value = v; o.textContent = "Every " + v + " s"; sel.append(o); sel.value = v; }
+  renderThinBackup(D);
   const totalN = D.tilts.reduce((a, t) => a + t.n, 0);
   $("loginfo").textContent = "Log file: " + D.log.path + " · " +
     (D.log.bytes / 1048576).toFixed(1) + " MB · " + totalN.toLocaleString() +
     " readings · batches file: " + D.batches_path;
 
   const tb = $("adminTilts"); tb.textContent = "";
-  for (const t of D.tilts) {
+  tiltNames = D.tilt_names || tiltNames;
+  const byKey = {};
+  for (const t of D.tilts) byKey[t.color] = { key: t.color, t };
+  for (const dv of (D.devices || [])) (byKey[dv.key] = byKey[dv.key] || { key: dv.key }).dev = dv;
+  for (const row of Object.values(byKey).sort((a, b) => a.key.localeCompare(b.key))) {
+    const key = row.key, t = row.t || { n: 0 };
     const tr = document.createElement("tr");
     const td1 = document.createElement("td");
     const d = document.createElement("span"); d.className = "dot";
-    d.style.background = hue(t.color);
-    td1.append(d, t.color);
+    d.style.background = hue(key);
+    td1.append(d, tiltLabel(key));
+    if (row.dev) {
+      const a = document.createElement("div");
+      a.style.cssText = "font-size:11px;color:var(--muted);margin-left:15px;";
+      a.textContent = row.dev.address;
+      td1.append(a);
+    }
     tr.append(td1);
-    for (const txt of [t.n.toLocaleString(),
-                       fmtDate(t.first_ts), fmtDate(t.last_ts)]) {
+    for (const txt of [(t.n || 0).toLocaleString(),
+                       t.first_ts ? fmtDate(t.first_ts) : "—", t.last_ts ? fmtDate(t.last_ts) : "—"]) {
       const td = document.createElement("td"); td.textContent = txt; tr.append(td);
     }
     const ta = document.createElement("td");
-    const csv = document.createElement("a"); csv.className = "btn";
-    csv.textContent = "CSV";
-    csv.href = "/api/export.csv?color=" + encodeURIComponent(t.color);
-    const rst = document.createElement("button"); rst.className = "btn danger";
-    rst.textContent = "Reset"; rst.style.marginLeft = "6px";
-    rst.addEventListener("click", () => resetTilt(t.color));
-    ta.append(csv, rst); tr.append(ta);
+    if (t.n) {
+      const csv = document.createElement("a"); csv.className = "btn";
+      csv.textContent = "CSV";
+      csv.href = "/api/export.csv?color=" + encodeURIComponent(key);
+      const rst = document.createElement("button"); rst.className = "btn danger";
+      rst.textContent = "Reset"; rst.style.marginLeft = "6px";
+      rst.addEventListener("click", () => resetTilt(key));
+      ta.append(csv, rst);
+    }
+    if (row.dev) {
+      const rn = document.createElement("button"); rn.className = "btn";
+      rn.textContent = "Rename"; rn.style.marginLeft = "6px";
+      rn.addEventListener("click", () => {
+        const v = prompt("Nickname for this Tilt (leave blank to clear):", tiltNames[key] || "");
+        if (v !== null) tiltAction({ action: "rename", key, name: v });
+      });
+      ta.append(rn);
+      if (!t.n) {
+        const fg = document.createElement("button"); fg.className = "btn danger";
+        fg.textContent = "Forget"; fg.style.marginLeft = "6px";
+        fg.title = "Release this Tilt's slot, e.g. after replacing a dead Tilt of the same colour";
+        fg.addEventListener("click", () => {
+          if (confirm("Forget this Tilt (" + row.dev.address + ")?\n\nIts slot is released so a " +
+              "replacement Tilt of the same colour can take it over. If this Tilt starts " +
+              "broadcasting again it will simply be registered again."))
+            tiltAction({ action: "forget", key });
+        });
+        ta.append(fg);
+      }
+    }
+    tr.append(ta);
     tb.append(tr);
   }
-  if (!D.tilts.length) {
+  if (!Object.keys(byKey).length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td"); td.colSpan = 5;
     td.textContent = "no readings logged yet"; td.style.color = "var(--muted)";
@@ -3567,6 +4234,8 @@ function renderWheelsAdmin() {
   renderWheelBlock("rwOdor", WHEELS.odorWheel, "odor");
 }
 
+$("thinBtn").addEventListener("click", thinOldData);
+$("thinDelBtn").addEventListener("click", deleteThinBackup);
 $("logint").addEventListener("change", async ev => {
   try {
     const r = await fetch("/api/settings", { method:"POST",
@@ -3881,8 +4550,8 @@ function openModal(rebrew) {
   const b = rebrewFrom ? rebrewFrom.batch : (D.batch || {});
   const color = rebrewFrom ? rebrewFrom.color : (D.color || "");
   $("mtitle").textContent = rebrewFrom
-    ? "New batch from “" + batchTitle(b) + "” — " + color + " Tilt"
-    : color + " Tilt — batch details";
+    ? "New batch from “" + batchTitle(b) + "” — " + tiltLabel(color) + " Tilt"
+    : tiltLabel(color) + " Tilt — batch details";
   $("f_name").value = b.name || "";
   $("f_style").value = b.style || "";
   // Rebrewing always starts a fresh "Day 1" today; otherwise show whatever
@@ -3908,7 +4577,7 @@ function openModal(rebrew) {
   $("mFinish").style.display = (!rebrewFrom && D.batch) ? "" : "none";
   $("mNew").textContent = rebrewFrom ? "Start batch" : "Start new batch";
   $("mhint").textContent = rebrewFrom
-    ? ("“Start batch” creates a new " + color + " Tilt batch using these details " +
+    ? ("“Start batch” creates a new " + tiltLabel(color) + " Tilt batch using these details " +
        "as a starting point. If that Tilt currently has a batch in progress, it's closed first.")
     : ("\"Save\" edits the current batch. \"Start new batch\" closes the current one and " +
        "begins a fresh batch now — OG, ABV and charts reset from this moment. Data is " +
@@ -4333,7 +5002,7 @@ buildAbvTiers(); buildSweetness(); buildYeastPicks();
 $("mSave").addEventListener("click", () => postBatch("save"));
 $("mNew").addEventListener("click", () => {
   if (rebrewFrom) {
-    if (confirm("Start a new " + rebrewFrom.color + " Tilt batch using these details? " +
+    if (confirm("Start a new " + tiltLabel(rebrewFrom.color) + " Tilt batch using these details? " +
                 "If that Tilt currently has a batch in progress, it will be closed first."))
       postBatch("new", rebrewFrom.color);
   } else if (confirm("Close the current batch and start a new one from now? " +
@@ -4666,11 +5335,42 @@ starting the rebrew closes it first, same as the regular "Start new batch".</p>
 <ul>
  <li><b>Logging interval</b> — how often readings are recorded, from every beacon
    (~1&ndash;4 s) to hourly. The logger applies changes within about 5 seconds; no
-   restart needed.</li>
+   restart needed. A fermentation changes slowly, so <b>every 1 minute</b> (or 5)
+   is plenty and keeps the log small &mdash; &ldquo;every beacon&rdquo; adds roughly
+   100,000 readings per day per Tilt and makes the dashboard slower the longer it runs.
+   The <b>Log file</b> line under the setting shows the log's size and total number of
+   readings.</li>
  <li><b>Tilt data</b> — per-Tilt reading counts, CSV export, and <b>Reset</b>, which
    erases that Tilt's logged readings and its current batch so the next brew starts
    clean. Finished-brew summaries stay in History. Reset cannot be undone — export
    any reports first.</li>
+ <li><b>Thin old data</b> — shrinks the log by keeping only one reading per Tilt every
+   few minutes for readings older than a cutoff you choose (1, 2, 3, 7, 14 or 30
+   days; 5&ndash;30 minute spacing). Use it if the dashboard has become slow, or the
+   log file has grown large. Click <b>Thin old data&hellip;</b> and a progress line
+   shows it working; first it checks the log and tells you exactly how many readings
+   would go and how much smaller the file would be, and nothing changes until you
+   confirm. <b>Your batches are not affected</b> &mdash; names, recipes, notes, brew
+   dates, stage markers, chart notes and History summaries are stored separately and
+   are never touched. Each batch also keeps its first and last reading and its highest
+   and lowest temperature, so its OG, final gravity and min/max stats stay the same.
+   What changes is that older charts, reports and CSV exports have fewer points (same
+   shape) and older reading counts drop. Readings newer than the cutoff, battery
+   reports, and anything the dashboard can't read are left exactly as they are.
+   Before it rewrites the log it saves a copy as <code>tilt.jsonl.pre-thin.bak</code>
+   next to it; once your charts and batches look right, press <b>Delete backup</b> in the same
+   card to free that space (this can't be undone). Only the most recent backup is kept
+   &mdash; thinning again replaces it. It needs enough free disk space for the backup,
+   and the dashboard may pause for a few seconds to a minute on a large log while it
+   works &mdash; keep the page open until it reports <b>Done</b>.</li>
+ <li><b>Two Tilts of the same colour</b> — every Tilt of one colour broadcasts the same
+   colour code, so they're told apart by their Bluetooth address (shown under the name
+   in <b>Tilt data</b>). The first one the dashboard ever heard of keeps the plain
+   colour name; the next appears automatically as <b>Red #2</b>, with a slightly lighter
+   shade on the charts, and gets its own tab, batches, History and reports. Use
+   <b>Rename</b> to give any Tilt a nickname. If you replace a Tilt with a new one of the
+   same colour, <b>Reset</b> the old one, then <b>Forget</b> it, and the new Tilt takes
+   over its slot. The mapping lives in <code>tilts.json</code> next to the log.</li>
  <li><b>Recipe wheels</b> — add, rename/recolor, or remove flavor and aroma
    categories and ingredients shown in the Recipe builder, right from the browser.
    A new ingredient always goes into a category you pick from what already exists,
@@ -4711,8 +5411,15 @@ any Tilt or batch until you copy one over.</p>
 <h2>Tips &amp; troubleshooting</h2>
 <ul>
  <li>The Tilt only broadcasts while floating or tilted — flat in its box it's silent.</li>
- <li>Two Tilts of the same colour can't be told apart; run concurrent brews on
-   different colours.</li>
+ <li>Two Tilts of the same colour are fine &mdash; each is recognised by its Bluetooth
+   address and shows up as its own tab (<b>Red</b>, <b>Red #2</b>, &hellip;). Give them
+   nicknames under <b>Admin &rarr; Tilt data &rarr; Rename</b> so you can tell them
+   apart at a glance. Keep each Tilt in its own vessel &mdash; two Tilts sharing a
+   fermenter just record the same brew twice.</li>
+ <li>If the dashboard feels slow or takes a long time to load, the log has probably
+   grown large. Set the <b>Logging interval</b> to 1 minute or more (Admin), then use
+   <b>Thin old data</b> to shrink what's already there. Loading is slowest right after
+   a restart, when the whole log is read once.</li>
  <li>A "no readings" card usually means the Tilt is out of range (~10 m), the
    batch just started, or the logger service is stopped.</li>
  <li>Gravity readings drift with krausen and CO&#8322; bubbles early in fermentation —
@@ -5321,6 +6028,9 @@ def main():
     ap.add_argument("--stagesfile", default=None,
                     help="Where the admin-curated fermentation stage list is "
                          "stored (default: stages.json next to the log file)")
+    ap.add_argument("--tiltsfile", default=None,
+                    help="Where the address->Tilt registry (and Tilt nicknames) "
+                         "is stored (default: tilts.json next to the log file)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--host", default="0.0.0.0",
                     help="Bind address (default all interfaces, so other "
@@ -5333,7 +6043,11 @@ def main():
     args = ap.parse_args()
 
     logdir = os.path.dirname(os.path.abspath(args.logfile))
-    Handler.cache = LogCache(args.logfile)
+    Handler.tilts = TiltRegistry(args.tiltsfile or os.path.join(logdir, "tilts.json"))
+    Handler.cache = LogCache(args.logfile, Handler.tilts)
+    # Read the existing log in the background right away, so the first page
+    # load after a restart doesn't have to wait for the whole file to parse.
+    threading.Thread(target=Handler.cache.records, daemon=True).start()
     Handler.store = BatchStore(args.batchfile or os.path.join(logdir, "batches.json"))
     Handler.settings = SettingsStore(args.settingsfile
                                      or os.path.join(logdir, "logger-settings.json"))

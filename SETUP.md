@@ -17,7 +17,7 @@ End-to-end setup for reading a Tilt / Tilt Pro / Tilt Mini Pro hydrometer with a
 
 ## Background: how the Tilt broadcasts
 
-The Tilt transmits Apple iBeacon advertisements over Bluetooth LE. A 16-byte UUID identifies the Tilt's colour; the iBeacon *major* field is temperature in °F and *minor* is specific gravity × 1000. Pro models (Tilt Pro, Mini Pro) broadcast at higher resolution — temperature × 10 and gravity × 10000 — and receivers detect a Pro when the raw gravity value is ≥ 5000. Both scripts auto-detect this, so any mix of Tilts works. Two Tilts of the **same colour can't be told apart** (they share a UUID), so simultaneous batches need different colours.
+The Tilt transmits Apple iBeacon advertisements over Bluetooth LE. A 16-byte UUID identifies the Tilt's colour; the iBeacon *major* field is temperature in °F and *minor* is specific gravity × 1000. Pro models (Tilt Pro, Mini Pro) broadcast at higher resolution — temperature × 10 and gravity × 10000 — and receivers detect a Pro when the raw gravity value is ≥ 5000. Both scripts auto-detect this, so any mix of Tilts works. Two Tilts of the **same colour** share that UUID, but the dashboard still tells them apart by each Tilt's Bluetooth address — see **Same-colour Tilts** under "Using the dashboard".
 
 **Battery age (unofficial, not a charge percentage):** the iBeacon's final byte is normally a fixed, negative TX-power calibration constant. Some Tilt firmware supports a real, intentional battery feature on top of this (implemented by the open-source [TiltBridge](https://github.com/thorrak/tiltbridge) project): that firmware broadcasts a TX power of exactly &minus;59&nbsp;dBm once as an "I support battery reporting" marker, and from then on repurposes the same byte to report **weeks since the battery was last changed** — not a charge level, and not bounded to 0&ndash;100. Both scripts implement the same two-state detection TiltBridge uses (see the `tilt_logger.py` module docstring), it never costs you a gravity/temperature reading (see Step 4/the log format below), and it's a nice-to-have that will simply never appear for hardware/firmware that doesn't support it.
 
@@ -174,7 +174,11 @@ Open `http://<pi-address>:8080/` from anything on your network.
 
 However you get there, the editor opens pre-filled from that old brew's name, style, batch size, yeast, IBU, target FG, target ABV, target ferm temp, image, and notes (including any flavor/aroma picks) — everything except the measured OG, which is brew-specific and left blank for you to re-enter on brew day — with today's date as the new batch's Day 1. **Chart notes don't carry over** — the new batch always starts with an empty notes timeline. Review or tweak the fields, then **Start batch**. If the destination Tilt already has a batch in progress, starting the rebrew closes it first, and you're warned before it happens; the original brew stays untouched in History either way.
 
-**Admin page** — set the dashboard's **Branding** (display name and tagline — see below), change the logging interval (every beacon up to hourly; the logger applies it within ~5 seconds, no restart), see per-Tilt data counts, export or **Reset** a Tilt (erases its readings and current batch so the next brew starts clean — cannot be undone), edit the **Recipe wheels** and **Fermentation stages** (see below for each), and install new versions of `tilt_dashboard.py` / `tilt_logger.py` from the browser.
+**Admin page** — set the dashboard's **Branding** (display name and tagline — see below), change the logging interval (every beacon up to hourly; the logger applies it within ~5 seconds, no restart — 1 minute is plenty for fermentation and keeps the log small), see per-Tilt data counts and rename Tilts, **thin old data** to keep a large log fast (see below), export or **Reset** a Tilt (erases its readings and current batch so the next brew starts clean — cannot be undone), edit the **Recipe wheels** and **Fermentation stages** (see below for each), and install new versions of `tilt_dashboard.py` / `tilt_logger.py` from the browser.
+
+**Same-colour Tilts** — two Tilts of one colour share a UUID, but each broadcast also carries the sender's Bluetooth address, which the logger records (`"address"` in every log line). The dashboard uses it to tell them apart: the first address it ever sees for a colour keeps the plain colour name (`Red`), further ones become `Red-2`, `Red-3`, … (shown as **Red #2** and drawn in a progressively lighter shade), each with its own tab, batches, History and reports. The mapping is stored in `tilts.json` beside the log. This needs the current `tilt_logger.py` as well as the dashboard — the logger is what records the address; older log lines with no address are treated as the first Tilt of their colour, so existing data is untouched.
+
+**Thin old data (Admin)** — a log that has been running a long time (especially with the logging interval at "every beacon", which adds roughly 100,000 readings per day per Tilt) makes every page load and refresh slower. **Admin → Thin old data** shrinks the *old* part of the log: pick a cutoff (1, 2, 3, 7, 14 or 30 days) and a spacing (one reading per Tilt every 5, 10, 15 or 30 minutes) and click **Thin old data…**. A progress line shows it working. It first checks the log and tells you exactly how many readings would be removed and how much smaller the file would get — nothing changes until you confirm. Batches are not affected: batch records (names, recipes, notes, brew dates, stage markers, chart notes, History summaries) live in separate files and are never touched, and each batch keeps its first and last reading and its highest and lowest temperature, so OG, final gravity and min/max stats are unchanged. Older charts, reports and CSVs simply have fewer points. Readings newer than the cutoff, readings carrying a battery report, and any line the dashboard can't parse are left exactly as they are. Before rewriting, the log is copied to `tilt.jsonl.pre-thin.bak` beside it; once everything looks right, **Delete backup** in the same card removes it (only the most recent backup is kept, and thinning again replaces it). It needs enough free disk space for the backup, streams the file rather than loading it into memory, and may take a while on a big log on a Pi — keep the page open until it says **Done**.
 
 **Branding (Admin)** — the dashboard's display name and tagline (shown in the header badge, the browser tab, printable reports, and archive files) are set from Admin → Branding, two plain text fields with a Save button. Changes apply immediately to every page, no restart needed, and persist to `brand.json` beside the log file. Nothing to edit in the code; a fresh install with no `brand.json` yet just shows the generic default ("Tilt Dashboard"). Uploads are syntax-checked, the old version is kept as a `.bak`, the dashboard restarts itself, and the logger is restarted by the watch units from Step 5. Web updates require the `--allow-updates` flag (included in the shipped service file — remove it to disable, since anyone on the network could otherwise push code to the Pi).
 
@@ -194,6 +198,8 @@ One JSON object per line (JSON Lines) in `/var/log/tilt/tilt.jsonl`:
 {"timestamp": "2026-08-24T14:03:07-04:00", "color": "Red", "model": "pro", "temp_f": 68.5, "temp_c": 20.28, "sg": 1.0165, "tx_power_dbm": -59, "battery_weeks": null, "raw_major": 685, "raw_minor": 10165, "rssi_dbm": -71, "address": "5A:09:9B:16:A3:04"}
 ```
 
+Each line also carries the sending Tilt's Bluetooth `address` (used to tell same-colour Tilts apart; older lines without it count as the first Tilt of their colour).
+
 `battery_weeks` is `null` on almost every line — it's only a number (weeks since that Tilt's battery was last changed) on firmware that supports battery reporting, and only once that Tilt has broadcast its one-time "-59 dBm" marker (see "Background" above). `tx_power_dbm` stays at its normal negative value on every other line, including for Tilts that don't support this at all.
 
 Loads directly into pandas: `pd.read_json("/var/log/tilt/tilt.jsonl", lines=True)`.
@@ -210,6 +216,12 @@ GET  /api/history                     finished batches with snapshots
 GET  /api/admin                       log info, per-Tilt counts, versions, current
                                        brand {"name": ..., "tagline": ...}
 GET  /api/settings                    {"interval": N, "allow_updates": bool}
+POST /api/tilts                       {"action":"rename"|"forget","key":"Red-2","name":...}
+                                       -- nickname a Tilt / release a replaced Tilt's slot
+                                       (forget only after its readings are reset)
+POST /api/thin                        {"days":7,"minutes":10,"dry_run":true|false} -- thin old
+                                       readings (dry_run reports what would change)
+POST /api/thin/backup/delete          delete the tilt.jsonl.pre-thin.bak backup
 GET  /api/recipe                      current flavor & odor wheel data
 GET  /api/stages                      current Admin-curated fermentation stage list
 GET  /api/export.csv?color=|id=       raw readings CSV; color= comes back empty (header
@@ -278,6 +290,7 @@ tilt_dashboard.py  --logfile PATH     (default /var/log/tilt/tilt.jsonl)
                    --draftsfile PATH  (default: recipe-drafts.json beside the log)
                    --stagesfile PATH  (default: stages.json beside the log)
                    --brandfile PATH   (default: brand.json beside the log)
+                   --tiltsfile PATH   (default: tilts.json beside the log — same-colour Tilt registry)
                    --port 8080
                    --host 0.0.0.0     (use 127.0.0.1 to restrict to the Pi itself)
                    --allow-updates    enable installing new versions from the Admin page
@@ -291,10 +304,12 @@ The dashboard has no authentication: anyone on your network can view it and edit
 
 ## Performance notes
 
-The dashboard parses the log once at first request and afterwards only reads newly appended lines, so it stays fast even with every-beacon logging — expect a several-second first page load on a Pi 3B+ with a large log, near-instant after that. Chart data is downsampled server-side to ≤400 points per series.
+The dashboard parses the log once at startup (in the background) and afterwards only reads newly appended lines. Each Tilt's readings are indexed, and time windows are found with a binary search, so a refresh stays fast even with a large log; chart data is downsampled server-side to ≤400 points per series. Expect the first page load after a restart to take a few seconds on a Pi 3B+ with a very large log. The thing that actually slows a dashboard down is log size, so use a sensible logging interval (1 minute is plenty for fermentation) and **Admin → Thin old data** if the log has grown big. Log rotation (Step 6) is detected and handled automatically.
 
 ## Troubleshooting
 
+- **The dashboard is slow to load or refresh**: the log has probably grown large (check the *Log file* line on the Admin page — hundreds of thousands of readings is the usual cause, typically from "every beacon" logging). Set the logging interval to 1 minute or more, then use **Admin → Thin old data**. The first page load after a restart is always the slowest, because the whole log is read once.
+- **A second Tilt of the same colour isn't showing up as its own Tilt**: both `tilt_logger.py` and `tilt_dashboard.py` must be the current versions (the logger records the address). Readings logged by an older logger carry no address and count as the first Tilt of that colour.
 - **No readings**: the Tilt only broadcasts when tilted/floating. Verify with `sudo bluetoothctl scan le`; check `hciconfig hci0 up`.
 - **`SetDiscoveryFilter failed: org.bluez.Error.NotReady`**: the Bluetooth adapter isn't powered on. Run `bluetoothctl power on` (then check `hciconfig` shows UP RUNNING); if `rfkill list` shows bluetooth soft-blocked, `sudo rfkill unblock bluetooth`. To make it stick across reboots, set `AutoEnable=true` under `[Policy]` in `/etc/bluetooth/main.conf` and `sudo systemctl restart bluetooth`. A single NotReady error in the journal right after boot is just the startup race — the service retries every 10 s until the adapter is ready.
 - **`bleak` errors about D-Bus/BlueZ**: make sure `bluetooth.service` is running (`systemctl status bluetooth`) and BlueZ is ≥ 5.55 (`bluetoothctl --version`); any current Raspberry Pi OS qualifies.

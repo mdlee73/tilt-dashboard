@@ -5,10 +5,12 @@ A self-contained fermentation dashboard for the [Tilt Hydrometer](https://tilthy
 ## Features
 
 - **Multi-Tilt dashboard** — one overview page for every Tilt currently fermenting something, with live gravity, estimated ABV, temperature, attenuation, and signal/battery status; a detail view per Tilt with synced charts and a recent-readings table.
+- **Same-colour Tilts** — two (or more) Tilts of one colour are told apart by their Bluetooth address, each with its own tab, batches, history and an optional nickname.
 - **Batch tracking** — name, style, brew date, yeast, target gravity/ABV/temperature, notes, and a photo per batch, with full history of every past brew once it's finished.
 - **Chart annotations** — pin a permanent note to an exact moment on the chart (a dry hop, a temperature change), and mark when a batch crossed into a later fermentation stage (secondary, bulk aging, bottle conditioning, or your own custom list) — both show up as markers right on the charts.
 - **Mead recipe builder** — a honey/water calculator, yeast picker, and flavor/aroma wheels for planning a mead before you brew, plus a standalone recipe explorer (`/recipes`) for sketching ideas with nothing started yet.
 - **Reports, CSV, and archives** — a printable brew report (with charts and notes), raw-data CSV export, and a one-file HTML archive that embeds a finished batch's complete data so it survives log rotation or a reset.
+- **Fast on a big log, with a one-click clean-up** — per-Tilt indexing keeps refreshes quick, and **Admin → Thin old data** shrinks a long-running log (with a preview, progress and a backup) without touching your batches.
 - **Configurable branding** — set your own display name and tagline from the Admin page; it shows in the header, browser tab, and every report, no code changes needed.
 - **Self-updating** — install new versions of the dashboard or logger straight from the Admin page, over the network, with no SSH session required after initial setup.
 - **Zero dependencies for the dashboard** — `tilt_dashboard.py` uses only the Python standard library. The logger (`tilt_logger.py`) needs one package ([`bleak`](https://github.com/hbldh/bleak)) to talk to Bluetooth.

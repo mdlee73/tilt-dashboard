@@ -148,8 +148,11 @@ class TiltLogger:
         self.settings = settings
         self.colour_filter = colour_filter.lower() if colour_filter else None
         self.min_interval = min_interval          # seconds; 0 = log every beacon
-        self._last_logged: dict[str, float] = {}  # colour -> monotonic timestamp
-        self._batt_capable: dict[str, bool] = {}  # colour -> has ever sent the -59 sentinel
+        # Per-DEVICE state, keyed by the Tilt's Bluetooth address (colour as a
+        # fallback if a platform doesn't report one). Two Tilts of the same
+        # colour share a colour UUID, so colour alone can't tell them apart.
+        self._last_logged: dict[str, float] = {}  # device -> monotonic timestamp
+        self._batt_capable: dict[str, bool] = {}  # device -> has ever sent the -59 sentinel
         self._count = 0
         self._pending: list[str] = []             # buffered lines while unwritable
         self._last_write_err = 0.0
@@ -207,7 +210,9 @@ class TiltLogger:
     # -- battery age (weeks since last battery change) -----------------------
     def _battery_weeks(self, color: str, tx_power_dbm: int):
         """Port of TiltBridge's m_has_sent_197 / receives_battery state machine
-        (src/tilt/tiltHydrometer.cpp), per colour rather than per MAC address.
+        (src/tilt/tiltHydrometer.cpp). `color` here is really a device key:
+        the Tilt's Bluetooth address (or its colour if none is reported), so
+        two same-colour Tilts each keep their own state.
 
         A Tilt that supports battery reporting sends TX power == -59 dBm (the
         unsigned byte 197) at least once as a one-time marker; every reading
@@ -241,22 +246,23 @@ class TiltLogger:
         if self.colour_filter and reading["color"].lower() != self.colour_filter:
             return
 
-        reading["battery_weeks"] = self._battery_weeks(reading["color"], reading["tx_power_dbm"])
+        dev = (device.address or "").upper() or reading["color"]
+        reading["battery_weeks"] = self._battery_weeks(dev, reading["tx_power_dbm"])
 
         now_mono = asyncio.get_event_loop().time()
-        last = self._last_logged.get(reading["color"], 0.0)
+        last = self._last_logged.get(dev, 0.0)
         # Battery-age readings are rare (broadcast occasionally, not on every
         # beacon) — never let the logging-interval throttle drop one.
         has_battery = reading["battery_weeks"] is not None
         if self.min_interval and not has_battery and (now_mono - last) < self.min_interval:
             return
-        self._last_logged[reading["color"]] = now_mono
+        self._last_logged[dev] = now_mono
 
         record = {
             "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             **reading,
             "rssi_dbm": adv_data.rssi,
-            "address": device.address,
+            "address": (device.address or "").upper() or None,
         }
         line = json.dumps(record)
 
