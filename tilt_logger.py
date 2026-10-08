@@ -153,6 +153,8 @@ class TiltLogger:
         # colour share a colour UUID, so colour alone can't tell them apart.
         self._last_logged: dict[str, float] = {}  # device -> monotonic timestamp
         self._batt_capable: dict[str, bool] = {}  # device -> has ever sent the -59 sentinel
+        self._batt_held: dict[str, int] = {}      # device -> battery weeks seen on a throttled beacon
+        self._batt_reported: dict[str, int] = {}  # device -> last weeks value written to the journal
         self._count = 0
         self._pending: list[str] = []             # buffered lines while unwritable
         self._last_write_err = 0.0
@@ -251,11 +253,20 @@ class TiltLogger:
 
         now_mono = asyncio.get_event_loop().time()
         last = self._last_logged.get(dev, 0.0)
-        # Battery-age readings are rare (broadcast occasionally, not on every
-        # beacon) — never let the logging-interval throttle drop one.
-        has_battery = reading["battery_weeks"] is not None
-        if self.min_interval and not has_battery and (now_mono - last) < self.min_interval:
+        # The logging interval applies to EVERY beacon, battery-carrying or
+        # not. (Once a Tilt has sent the battery sentinel, every later beacon
+        # carries a weeks value, so exempting those readings from the throttle
+        # would silently log every beacon no matter what interval is set.) A
+        # battery value seen on a throttled beacon is held and attached to the
+        # next reading that IS logged, so no battery report is ever lost.
+        if self.min_interval and (now_mono - last) < self.min_interval:
+            if reading["battery_weeks"] is not None:
+                self._batt_held[dev] = reading["battery_weeks"]
             return
+        if reading["battery_weeks"] is None and dev in self._batt_held:
+            reading["battery_weeks"] = self._batt_held[dev]
+        self._batt_held.pop(dev, None)
+        has_battery = reading["battery_weeks"] is not None
         self._last_logged[dev] = now_mono
 
         record = {
@@ -281,7 +292,8 @@ class TiltLogger:
             log.info("Logged %d readings (latest: %s %.4g SG, %.1f °F, RSSI %d dBm)",
                      self._count, record["color"], record["sg"],
                      record["temp_f"], record["rssi_dbm"])
-        if has_battery:
+        if has_battery and self._batt_reported.get(dev) != record["battery_weeks"]:
+            self._batt_reported[dev] = record["battery_weeks"]   # journal it once per change
             log.info("%s Tilt reports battery last changed %d week(s) ago",
                      record["color"], record["battery_weeks"])
 
